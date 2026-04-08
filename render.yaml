@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: dshow-whatsapp-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn bot:app --workers 1 --threads 2 --timeout 120
+    envVars:
+      - key: ANTHROPIC_API_KEY
+        value: YOUR_ANTHROPIC_KEY_HERE
+      - key: GREEN_API_INSTANCE
+        value: "7107581380"
+      - key: GREEN_API_TOKEN
+        value: YOUR_GREEN_API_TOKEN_HERE
+      - key: PORT
+        value: "10000"
+    plan: free
