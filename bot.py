@@ -189,12 +189,19 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 _sheet_cache = None
+_sheet_failed = False  # אם נכשל — לא לנסות שוב בכל request
 
 def get_sheet():
-    """מחזיר את גיליון ה-conversations, עם cache."""
-    global _sheet_cache
+    """מחזיר את גיליון ה-conversations, עם cache. יוצר אותו אם לא קיים."""
+    global _sheet_cache, _sheet_failed
     if _sheet_cache is not None:
         return _sheet_cache
+    if _sheet_failed:
+        return None
+    if not GOOGLE_CREDS_JSON:
+        print("[Sheets Error] GOOGLE_CREDS_JSON env var is empty — running without memory")
+        _sheet_failed = True
+        return None
     try:
         creds_info = json.loads(GOOGLE_CREDS_JSON)
         scopes = [
@@ -204,10 +211,28 @@ def get_sheet():
         creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
         client = gspread.authorize(creds)
         spreadsheet = client.open(SHEET_NAME)
-        _sheet_cache = spreadsheet.worksheet("conversations")
+
+        # נסה לפתוח את הטאב conversations
+        try:
+            ws = spreadsheet.worksheet("conversations")
+        except gspread.exceptions.WorksheetNotFound:
+            print("[Sheets] Worksheet 'conversations' not found — creating it...")
+            ws = spreadsheet.add_worksheet(title="conversations", rows=1000, cols=3)
+            ws.append_row(["phone_number", "history", "last_updated"])
+            print("[Sheets] Worksheet 'conversations' created with headers.")
+
+        # וודא שיש כותרות בשורה 1
+        headers = ws.row_values(1)
+        if not headers or headers[0] != "phone_number":
+            ws.update("A1:C1", [["phone_number", "history", "last_updated"]])
+            print("[Sheets] Headers written to row 1.")
+
+        _sheet_cache = ws
+        print("[Sheets] Connected successfully ✓")
         return _sheet_cache
     except Exception as e:
         print(f"[Sheets Error] {e}")
+        _sheet_failed = True
         return None
 
 
@@ -362,8 +387,8 @@ def webhook():
 # ─────────────────────────────────────────
 # Health Check
 # ─────────────────────────────────────────
-@app.route("/health", methods=["GET"])
-def health():
+@app.route("/ping", methods=["GET"])
+def ping():
     return jsonify({
         "status": "ok",
         "bot": "D-SHOW WhatsApp Sales Bot",
@@ -517,11 +542,43 @@ def train_chat():
 def train_reset():
     data = request.json or {}
     session_id = data.get("session", "train_default")
-    h = load_history()
-    if session_id in h:
-        del h[session_id]
-        save_history(h)
+    # מחק את ה-session מה-Sheets
+    sheet = get_sheet()
+    if sheet is not None:
+        try:
+            records = sheet.get_all_records()
+            for i, row in enumerate(records, start=2):
+                if str(row.get("phone_number", "")) == session_id:
+                    sheet.update(f"B{i}", [[json.dumps([], ensure_ascii=False)]])
+                    break
+        except Exception as e:
+            print(f"[Train Reset Error] {e}")
     return jsonify({"status": "reset"})
+
+
+@app.route("/status", methods=["GET"])
+def status():
+    """בדיקת סטטוס כל הרכיבים"""
+    results = {
+        "bot": "D-SHOW WhatsApp Sales Bot v3.0",
+        "anthropic_key": "✓ set" if ANTHROPIC_API_KEY else "✗ MISSING",
+        "green_api_instance": GREEN_API_INSTANCE or "✗ MISSING",
+        "green_api_token": "✓ set" if GREEN_API_TOKEN else "✗ MISSING",
+        "google_creds": "✓ set" if GOOGLE_CREDS_JSON else "✗ MISSING",
+        "sheets_connection": "unknown",
+    }
+    # בדוק חיבור לשיטס
+    sheet = get_sheet()
+    if sheet is not None:
+        results["sheets_connection"] = f"✓ connected to '{sheet.title}'"
+    else:
+        results["sheets_connection"] = "✗ failed (check logs)"
+    return jsonify(results)
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok", "bot": "D-SHOW WhatsApp Sales Bot", "version": "3.0"})
 
 
 # ─────────────────────────────────────────
