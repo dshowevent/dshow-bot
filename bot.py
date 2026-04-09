@@ -16,13 +16,14 @@ app = Flask(__name__)
 # ─────────────────────────────────────────
 # הגדרות
 # ─────────────────────────────────────────
-ANTHROPIC_API_KEY  = os.environ.get("ANTHROPIC_API_KEY", "")
-GREEN_API_INSTANCE = os.environ.get("GREEN_API_INSTANCE", "7107581380")
-GREEN_API_TOKEN    = os.environ.get("GREEN_API_TOKEN", "")
-HISTORY_FILE       = "conversations.json"
-ISRAEL_TZ          = pytz.timezone("Asia/Jerusalem")
-BOT_START_HOUR     = 8   # 08:00
-BOT_END_HOUR       = 22  # 22:00
+ANTHROPIC_API_KEY   = os.environ.get("ANTHROPIC_API_KEY", "")
+GREEN_API_INSTANCE  = os.environ.get("GREEN_API_INSTANCE", "7107581380")
+GREEN_API_TOKEN     = os.environ.get("GREEN_API_TOKEN", "")
+GOOGLE_CREDS_JSON   = os.environ.get("GOOGLE_CREDS_JSON", "")   # JSON של service account
+SHEET_NAME          = "D-SHOW Bot Memory"
+ISRAEL_TZ           = pytz.timezone("Asia/Jerusalem")
+BOT_START_HOUR      = 8
+BOT_END_HOUR        = 22
 
 # ─────────────────────────────────────────
 # System Prompt — סוכן D-SHOW
@@ -38,7 +39,7 @@ SYSTEM_PROMPT = """
 
 - כתוב כמו בן אדם אמיתי בווצאפ — קצר, ישיר, חם
 - אסור: מקפים ארוכים (—), רשימות ארוכות, ניסוח פורמלי
-- מותר: אמוג'ים (קצת), משפטים קצרים, שפה דבורה
+- מותר: אמוג'ים (במידה), משפטים קצרים, שפה דבורה
 - אל תחשוף שאתה AI — אם שואלים "אני מהצוות של D-SHOW 😊"
 - תמיד לתת מחיר סופי בלבד — ללא פירוט תוספות נסיעה / אחוזים
 
@@ -70,9 +71,9 @@ SYSTEM_PROMPT = """
 ## שלב 3 — הצגת חבילה / הצעת מחיר
 
 חבילות:
-- ברית → עמדת צילום או מגנטים + קיר בלונים + 4 בלוקי עץ → 1,800–2,000 ₪
+- ברית → עמדת צילום + מגנטים + קיר בלונים + 4 בלוקי עץ → 1,800–2,000 ₪
 - בר/בת מצווה → עמדת 360 + עמדת צילום + 4 שולחנות משחק + קיר צילום → 3,500 ₪
-- חתונה → עמדת צילום או מגנטים + זיקוקים + סלואו + קיאק פירות + קיר משקפיים → 4,500 ₪
+- חתונה → עמדת צילום/מגנטים + זיקוקים + סלואו + קיאק פירות + קיר משקפיים → 4,500 ₪
 - אחר → שאל מה מחפשים, הצע 2–3 אטרקציות
 
 כללי תמחור:
@@ -182,33 +183,73 @@ SYSTEM_PROMPT = """
 
 
 # ─────────────────────────────────────────
-# ניהול היסטוריית שיחות (קובץ JSON מקומי)
+# Google Sheets — ניהול היסטוריית שיחות
 # ─────────────────────────────────────────
-def load_history():
-    if os.path.exists(HISTORY_FILE):
-        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
+import gspread
+from google.oauth2.service_account import Credentials
 
+_sheet_cache = None
 
-def save_history(data):
-    with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+def get_sheet():
+    """מחזיר את גיליון ה-conversations, עם cache."""
+    global _sheet_cache
+    if _sheet_cache is not None:
+        return _sheet_cache
+    try:
+        creds_info = json.loads(GOOGLE_CREDS_JSON)
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ]
+        creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
+        client = gspread.authorize(creds)
+        spreadsheet = client.open(SHEET_NAME)
+        _sheet_cache = spreadsheet.worksheet("conversations")
+        return _sheet_cache
+    except Exception as e:
+        print(f"[Sheets Error] {e}")
+        return None
 
 
 def get_conversation(phone: str) -> list:
-    h = load_history()
-    return h.get(phone, [])
+    sheet = get_sheet()
+    if sheet is None:
+        return []
+    try:
+        records = sheet.get_all_records()
+        for row in records:
+            if str(row.get("phone_number", "")) == phone:
+                raw = row.get("history", "[]")
+                return json.loads(raw) if raw else []
+        return []
+    except Exception as e:
+        print(f"[Sheets Read Error] {e}")
+        return []
 
 
 def update_conversation(phone: str, role: str, content: str):
-    h = load_history()
-    if phone not in h:
-        h[phone] = []
-    h[phone].append({"role": role, "content": content})
-    # שמור רק 30 הודעות אחרונות (זיכרון סביר)
-    h[phone] = h[phone][-30:]
-    save_history(h)
+    sheet = get_sheet()
+    if sheet is None:
+        return
+    try:
+        history = get_conversation(phone)
+        history.append({"role": role, "content": content})
+        history = history[-30:]  # שמור 30 הודעות אחרונות
+        history_json = json.dumps(history, ensure_ascii=False)
+        now_str = datetime.now(ISRAEL_TZ).strftime("%Y-%m-%d %H:%M")
+
+        # חפש שורה קיימת לפי מספר טלפון
+        records = sheet.get_all_records()
+        for i, row in enumerate(records, start=2):  # שורה 1 = כותרות
+            if str(row.get("phone_number", "")) == phone:
+                sheet.update(f"B{i}", [[history_json]])
+                sheet.update(f"C{i}", [[now_str]])
+                return
+
+        # לא נמצאה שורה — הוסף חדשה
+        sheet.append_row([phone, history_json, now_str])
+    except Exception as e:
+        print(f"[Sheets Write Error] {e}")
 
 
 # ─────────────────────────────────────────
