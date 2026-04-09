@@ -9,7 +9,6 @@ import re
 from datetime import datetime, time
 import pytz
 from flask import Flask, request, jsonify
-import anthropic
 import requests
 
 app = Flask(__name__)
@@ -235,23 +234,32 @@ def send_whatsapp(chat_id: str, message: str) -> bool:
 
 
 # ─────────────────────────────────────────
-# קריאה ל-Claude API
+# קריאה ל-Claude API (HTTP ישיר — בלי SDK)
 # ─────────────────────────────────────────
 def get_claude_response(phone: str, user_message: str) -> str:
     history = get_conversation(phone)
-
-    # הוסף הודעה נוכחית להיסטוריה זמנית לשליחה
     messages = history + [{"role": "user", "content": user_message}]
 
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    headers = {
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+    payload = {
+        "model": "claude-opus-4-5",
+        "max_tokens": 1024,
+        "system": SYSTEM_PROMPT,
+        "messages": messages,
+    }
     try:
-        response = client.messages.create(
-            model="claude-opus-4-5",
-            max_tokens=1024,
-            system=SYSTEM_PROMPT,
-            messages=messages,
+        r = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers=headers,
+            json=payload,
+            timeout=30,
         )
-        return response.content[0].text
+        r.raise_for_status()
+        return r.json()["content"][0]["text"]
     except Exception as e:
         print(f"[Claude API Error] {e}")
         return "מצטערים, יש תקלה טכנית זמנית 🙏 נחזור אליכם בהקדם!"
@@ -326,6 +334,153 @@ def health():
 @app.route("/", methods=["GET"])
 def index():
     return "🎉 D-SHOW Bot is running!", 200
+
+
+# ─────────────────────────────────────────
+# ממשק אימון — /train
+# ─────────────────────────────────────────
+TRAIN_HTML = """<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>D-SHOW | אימון סוכן</title>
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+body { background:#0D0D0D; color:#F5F3EE; font-family:'Segoe UI',Arial,sans-serif; height:100vh; display:flex; flex-direction:column; }
+.header { background:#141414; border-bottom:1px solid #242424; padding:14px 20px; display:flex; align-items:center; gap:12px; }
+.header h1 { font-size:16px; font-weight:700; color:#C9A84C; }
+.header .badge { font-size:11px; background:rgba(37,211,102,0.15); color:#25D366; padding:3px 10px; border-radius:20px; }
+.reset-btn { margin-right:auto; background:rgba(224,85,85,0.15); color:#E05555; border:1px solid rgba(224,85,85,0.3); padding:6px 14px; border-radius:8px; cursor:pointer; font-size:12px; }
+.reset-btn:hover { background:rgba(224,85,85,0.25); }
+.chat { flex:1; overflow-y:auto; padding:20px; display:flex; flex-direction:column; gap:12px; }
+.msg { display:flex; flex-direction:column; max-width:75%; }
+.msg.user { align-self:flex-start; }
+.msg.bot { align-self:flex-end; }
+.msg-label { font-size:11px; color:#6B6B6B; margin-bottom:4px; padding:0 4px; }
+.msg.bot .msg-label { text-align:left; }
+.bubble { padding:10px 14px; border-radius:12px; font-size:14px; line-height:1.6; white-space:pre-wrap; word-break:break-word; }
+.msg.user .bubble { background:#1F3A2A; color:#DCF8C6; border-bottom-right-radius:3px; }
+.msg.bot .bubble { background:#242424; color:#F5F3EE; border-bottom-left-radius:3px; }
+.typing .bubble { color:#6B6B6B; font-style:italic; }
+.input-area { background:#141414; border-top:1px solid #242424; padding:14px 16px; display:flex; gap:10px; align-items:flex-end; }
+textarea { flex:1; background:#1C1C1C; border:1px solid #242424; border-radius:10px; color:#F5F3EE; font-size:14px; padding:10px 14px; resize:none; outline:none; font-family:inherit; min-height:44px; max-height:120px; }
+textarea:focus { border-color:#C9A84C; }
+button#send { background:#C9A84C; color:#0D0D0D; border:none; border-radius:10px; padding:10px 20px; font-weight:700; font-size:14px; cursor:pointer; height:44px; white-space:nowrap; }
+button#send:hover { background:#E8C96A; }
+button#send:disabled { background:#333; color:#666; cursor:not-allowed; }
+.empty-state { flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:8px; color:#6B6B6B; }
+.empty-state .icon { font-size:40px; }
+</style>
+</head>
+<body>
+<div class="header">
+  <span style="font-size:20px">🎯</span>
+  <h1>D-SHOW — סימולטור אימון</h1>
+  <span class="badge">● סוכן פעיל</span>
+  <button class="reset-btn" onclick="resetChat()">🗑 אפס שיחה</button>
+</div>
+<div class="chat" id="chat">
+  <div class="empty-state">
+    <div class="icon">💬</div>
+    <div>שלח הודעה לתרגל עם הסוכן</div>
+    <div style="font-size:12px">דוגמה: "היי אשמח לשמוע על האטרקציות שלכם"</div>
+  </div>
+</div>
+<div class="input-area">
+  <textarea id="msg" placeholder="כתוב הודעה כאילו אתה לקוח..." rows="1" onkeydown="handleKey(event)" oninput="autoResize(this)"></textarea>
+  <button id="send" onclick="sendMsg()">שלח</button>
+</div>
+<script>
+const SESSION_ID = 'train_' + Math.random().toString(36).substr(2,9);
+let chatEl = document.getElementById('chat');
+let sending = false;
+
+function autoResize(el) {
+  el.style.height = 'auto';
+  el.style.height = Math.min(el.scrollHeight, 120) + 'px';
+}
+
+function handleKey(e) {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMsg(); }
+}
+
+function addMsg(role, text) {
+  let empty = chatEl.querySelector('.empty-state');
+  if (empty) empty.remove();
+  let div = document.createElement('div');
+  div.className = 'msg ' + role;
+  div.innerHTML = `<div class="msg-label">${role === 'user' ? '👤 לקוח (אתה)' : '🤖 סוכן D-SHOW'}</div><div class="bubble">${text.replace(/</g,'&lt;').replace(/>/g,'&gt;')}</div>`;
+  chatEl.appendChild(div);
+  chatEl.scrollTop = chatEl.scrollHeight;
+  return div;
+}
+
+async function sendMsg() {
+  if (sending) return;
+  let ta = document.getElementById('msg');
+  let text = ta.value.trim();
+  if (!text) return;
+  ta.value = '';
+  ta.style.height = 'auto';
+  addMsg('user', text);
+  sending = true;
+  document.getElementById('send').disabled = true;
+  let typingEl = addMsg('bot typing', '...');
+  try {
+    let res = await fetch('/train/chat', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({session: SESSION_ID, message: text})
+    });
+    let data = await res.json();
+    typingEl.remove();
+    addMsg('bot', data.reply || 'שגיאה בקבלת תגובה');
+  } catch(e) {
+    typingEl.remove();
+    addMsg('bot', 'שגיאת חיבור 🙏');
+  }
+  sending = false;
+  document.getElementById('send').disabled = false;
+  ta.focus();
+}
+
+async function resetChat() {
+  await fetch('/train/reset', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({session: SESSION_ID})});
+  chatEl.innerHTML = '<div class="empty-state"><div class="icon">💬</div><div>שיחה אופסה — התחל מחדש</div></div>';
+}
+</script>
+</body>
+</html>"""
+
+
+@app.route("/train", methods=["GET"])
+def train_page():
+    return TRAIN_HTML
+
+
+@app.route("/train/chat", methods=["POST"])
+def train_chat():
+    data = request.json or {}
+    session_id = data.get("session", "train_default")
+    user_message = data.get("message", "").strip()
+    if not user_message:
+        return jsonify({"reply": ""}), 400
+    reply = get_claude_response(session_id, user_message)
+    update_conversation(session_id, "user", user_message)
+    update_conversation(session_id, "assistant", reply)
+    return jsonify({"reply": reply})
+
+
+@app.route("/train/reset", methods=["POST"])
+def train_reset():
+    data = request.json or {}
+    session_id = data.get("session", "train_default")
+    h = load_history()
+    if session_id in h:
+        del h[session_id]
+        save_history(h)
+    return jsonify({"status": "reset"})
 
 
 # ─────────────────────────────────────────
